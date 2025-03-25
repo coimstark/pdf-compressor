@@ -6,6 +6,7 @@ from argparse import ArgumentParser
 from glob import glob
 from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
+import pathlib
 
 from pdf_compressor.ilovepdf import Compress, ILovePDF
 from pdf_compressor.utils import ROOT, del_or_keep_compressed, load_dotenv
@@ -150,13 +151,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"invalid API key, must start with 'project_public_', got {new_key=}"
             )
 
-        with open(f"{ROOT}/.env", "w+", encoding="utf8") as file:
+        env_path = pathlib.Path(ROOT) / ".env"
+        with open(env_path, "w+", encoding="utf8") as file:
             file.write(f"ILOVEPDF_PUBLIC_KEY={new_key}\n")
 
         return 0
 
     load_dotenv()
-    if not (api_key := os.environ[API_KEY_KEY]):
+    try:
+        api_key = os.environ[API_KEY_KEY]
+    except KeyError:
         raise MISSING_API_KEY_ERR
 
     if args.report_quota:
@@ -217,7 +221,9 @@ def compress(
         min_size_reduction = 10 if inplace else 0
 
     load_dotenv()
-    if not (api_key := os.environ[API_KEY_KEY]):
+    try:
+        api_key = os.environ[API_KEY_KEY]
+    except KeyError:
         raise MISSING_API_KEY_ERR
 
     if not (inplace or suffix):
@@ -226,19 +232,38 @@ def compress(
             " non-empty suffix to append to the name of compressed files."
         )
 
-    # use set() to ensure no duplicate files
-    uniq_files: list[str] = sorted({fn.replace("\\", "/").strip() for fn in filenames})
+    # Convert input filenames to Path objects to handle OS-specific path operations
+    uniq_files = set()
+    for fn in filenames:
+        # Use normpath to standardize path separators for the OS
+        normalized_path = os.path.normpath(fn.strip())
+        uniq_files.add(normalized_path)
+    
+    # Sort the unique files for consistent processing order
+    uniq_files_sorted = sorted(uniq_files)
+    
     # for each directory received glob for all PDFs in it
     file_paths = []
-    for file_path in uniq_files:
+    for file_path in uniq_files_sorted:
         if os.path.isdir(file_path):
-            file_paths += glob(os.path.join(file_path, "**", "*.pdf*"), recursive=True)
+            # Use pathlib for better cross-platform path handling
+            search_path = pathlib.Path(file_path).joinpath("**", "*.pdf*")
+            # Convert search_path to string for glob
+            glob_pattern = str(search_path)
+            matches = glob(glob_pattern, recursive=True)
+            file_paths.extend([os.path.normpath(match) for match in matches])
         else:
-            file_paths += [file_path]
+            file_paths.append(file_path)
 
     # match files case insensitively ending with .pdf(,a,x) and possible white space
-    pdf_paths = [f for f in file_paths if re.match(r".*\.pdf[ax]?\s*$", f.lower())]
-    not_pdf_paths = {*file_paths} - {*pdf_paths}
+    pdf_paths = []
+    for f in file_paths:
+        # Normalize the path and remove trailing whitespace
+        normalized = os.path.normpath(f.rstrip())
+        if re.match(r".*\.pdf[ax]?\s*$", normalized.lower()):
+            pdf_paths.append(normalized)
+    
+    not_pdf_paths = set(file_paths) - set(pdf_paths)
 
     if on_bad_files == "error" and len(not_pdf_paths) > 0:
         raise ValueError(
@@ -272,7 +297,9 @@ def compress(
 
     task.process()
 
-    downloaded_file = task.download(save_to_dir=outdir)
+    # Ensure outdir path is normalized
+    outdir_path = os.path.normpath(outdir) if outdir else ""
+    downloaded_file = task.download(save_to_dir=outdir_path)
 
     task.delete_current_task()
 
@@ -299,14 +326,17 @@ def compress(
         df_stats.index.name = "file"
         stats_path_lower = write_stats_path.strip().lower()
 
+        # Ensure the stats path is normalized
+        normalized_stats_path = os.path.normpath(write_stats_path)
+
         if ".csv" in stats_path_lower:
-            df_stats.to_csv(write_stats_path, float_format="%.4f")
+            df_stats.to_csv(normalized_stats_path, float_format="%.4f")
         elif ".xlsx" in stats_path_lower or ".xls" in stats_path_lower:
-            df_stats.to_excel(write_stats_path, float_format="%.4f")
+            df_stats.to_excel(normalized_stats_path, float_format="%.4f")
         elif ".json" in stats_path_lower:
-            df_stats.to_json(write_stats_path)
+            df_stats.to_json(normalized_stats_path)
         elif ".html" in stats_path_lower:
-            df_stats.to_html(write_stats_path, float_format="%.4f")
+            df_stats.to_html(normalized_stats_path, float_format="%.4f")
 
     return 0
 
