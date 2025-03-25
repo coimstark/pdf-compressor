@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import tempfile
 from argparse import ArgumentParser
 from glob import glob
 from importlib.metadata import version
-from typing import TYPE_CHECKING, Any
-import pathlib
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict
+from zipfile import ZipFile
 
 from pdf_compressor.ilovepdf import Compress, ILovePDF
 from pdf_compressor.utils import ROOT, del_or_keep_compressed, load_dotenv
@@ -151,7 +154,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"invalid API key, must start with 'project_public_', got {new_key=}"
             )
 
-        env_path = pathlib.Path(ROOT) / ".env"
+        env_path = Path(ROOT) / ".env"
         with open(env_path, "w+", encoding="utf8") as file:
             file.write(f"ILOVEPDF_PUBLIC_KEY={new_key}\n")
 
@@ -160,6 +163,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     load_dotenv()
     try:
         api_key = os.environ[API_KEY_KEY]
+        if not api_key:
+            raise MISSING_API_KEY_ERR
     except KeyError:
         raise MISSING_API_KEY_ERR
 
@@ -223,6 +228,8 @@ def compress(
     load_dotenv()
     try:
         api_key = os.environ[API_KEY_KEY]
+        if not api_key:
+            raise MISSING_API_KEY_ERR
     except KeyError:
         raise MISSING_API_KEY_ERR
 
@@ -232,12 +239,14 @@ def compress(
             " non-empty suffix to append to the name of compressed files."
         )
 
-    # Convert input filenames to Path objects to handle OS-specific path operations
+    # Convert input filenames to absolute paths using Path objects
     uniq_files = set()
     for fn in filenames:
-        # Use normpath to standardize path separators for the OS
-        normalized_path = os.path.normpath(fn.strip())
-        uniq_files.add(normalized_path)
+        # Use Path to standardize path handling across OS
+        path_obj = Path(fn.strip())
+        # Convert to absolute path and normalize
+        abs_path = str(path_obj.absolute())
+        uniq_files.add(abs_path)
     
     # Sort the unique files for consistent processing order
     uniq_files_sorted = sorted(uniq_files)
@@ -246,22 +255,22 @@ def compress(
     file_paths = []
     for file_path in uniq_files_sorted:
         if os.path.isdir(file_path):
-            # Use pathlib for better cross-platform path handling
-            search_path = pathlib.Path(file_path).joinpath("**", "*.pdf*")
+            # Use Path for better cross-platform path handling
+            search_path = Path(file_path) / "**" / "*.pdf*"
             # Convert search_path to string for glob
             glob_pattern = str(search_path)
             matches = glob(glob_pattern, recursive=True)
-            file_paths.extend([os.path.normpath(match) for match in matches])
+            file_paths.extend([str(Path(match).absolute()) for match in matches])
         else:
             file_paths.append(file_path)
 
     # match files case insensitively ending with .pdf(,a,x) and possible white space
     pdf_paths = []
     for f in file_paths:
-        # Normalize the path and remove trailing whitespace
-        normalized = os.path.normpath(f.rstrip())
-        if re.match(r".*\.pdf[ax]?\s*$", normalized.lower()):
-            pdf_paths.append(normalized)
+        # Use Path object for better path handling
+        path_obj = Path(f.rstrip())
+        if re.match(r".*\.pdf[ax]?\s*$", path_obj.name.lower()):
+            pdf_paths.append(str(path_obj))
     
     not_pdf_paths = set(file_paths) - set(pdf_paths)
 
@@ -297,18 +306,24 @@ def compress(
 
     task.process()
 
-    # Ensure outdir path is normalized
-    outdir_path = os.path.normpath(outdir) if outdir else ""
-    downloaded_file = task.download(save_to_dir=outdir_path)
+    # Create a temporary directory to safely extract the downloaded file
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Download the file to the temporary directory
+        downloaded_file = task.download(save_to_dir=temp_dir)
+        task.delete_current_task()
 
-    task.delete_current_task()
+        # If in debug mode, no need to process the files
+        if debug:
+            return 0
 
-    min_size_red = min_size_reduction or (10 if inplace else 0)
-
-    if not debug:
-        stats = del_or_keep_compressed(
+        # Handle the downloaded file (which may be a zip file)
+        min_size_red = min_size_reduction or (10 if inplace else 0)
+        
+        # Process the downloaded file
+        stats = process_compressed_files(
             pdf_paths,
             downloaded_file,
+            outdir=outdir, 
             inplace=inplace,
             suffix=suffix,
             min_size_reduction=min_size_red,
@@ -327,18 +342,143 @@ def compress(
         stats_path_lower = write_stats_path.strip().lower()
 
         # Ensure the stats path is normalized
-        normalized_stats_path = os.path.normpath(write_stats_path)
+        stats_file_path = Path(write_stats_path)
 
         if ".csv" in stats_path_lower:
-            df_stats.to_csv(normalized_stats_path, float_format="%.4f")
+            df_stats.to_csv(stats_file_path, float_format="%.4f")
         elif ".xlsx" in stats_path_lower or ".xls" in stats_path_lower:
-            df_stats.to_excel(normalized_stats_path, float_format="%.4f")
+            df_stats.to_excel(stats_file_path, float_format="%.4f")
         elif ".json" in stats_path_lower:
-            df_stats.to_json(normalized_stats_path)
+            df_stats.to_json(stats_file_path)
         elif ".html" in stats_path_lower:
-            df_stats.to_html(normalized_stats_path, float_format="%.4f")
+            df_stats.to_html(stats_file_path, float_format="%.4f")
 
     return 0
+
+
+def process_compressed_files(
+    original_files: list[str],
+    zip_file_path: str,
+    outdir: str = "",
+    inplace: bool = False,
+    suffix: str = DEFAULT_SUFFIX,
+    min_size_reduction: int = 0,
+    verbose: bool = False,
+) -> Dict[str, Dict]:
+    """Process the compressed files from the zip file.
+    
+    Args:
+        original_files (list[str]): List of original PDF file paths
+        zip_file_path (str): Path to the downloaded ZIP file from iLovePDF
+        outdir (str): Output directory for extracted files
+        inplace (bool): Whether to replace original files
+        suffix (str): Suffix to add to filenames if not replacing
+        min_size_reduction (int): Minimum size reduction percentage to keep files
+        verbose (bool): Whether to print verbose output
+        
+    Returns:
+        Dict: Stats dictionary with file information
+    """
+    stats = {}
+    
+    # Create the output directory if specified and doesn't exist
+    out_dir_path = Path(outdir) if outdir else Path.cwd()
+    os.makedirs(out_dir_path, exist_ok=True)
+    
+    # Extract the files to a temporary directory
+    with tempfile.TemporaryDirectory() as extract_dir:
+        with ZipFile(zip_file_path, 'r') as zipf:
+            # Extract all files to the temporary directory
+            zipf.extractall(extract_dir)
+            
+            # Get a mapping of filenames in the ZIP to their paths in the extract_dir
+            extracted_files = {}
+            for file_info in zipf.infolist():
+                if not file_info.is_dir():
+                    # Extract only the filename without any directories
+                    base_name = os.path.basename(file_info.filename)
+                    # Map to the path in the extract_dir
+                    extracted_files[base_name] = os.path.join(extract_dir, file_info.filename)
+        
+        # Process each original file
+        for i, original_path in enumerate(original_files):
+            # Get the base name of the original file
+            original_file = Path(original_path)
+            filename = original_file.name
+            
+            # Find the corresponding extracted file
+            # First try exact match, then try with index prefix that iLovePDF might add
+            extracted_path = None
+            if filename in extracted_files:
+                extracted_path = extracted_files[filename]
+            else:
+                # Try looking for files that might have been prefixed with an index
+                for extracted_name, path in extracted_files.items():
+                    # Check if filename is in the extracted name (might have prefix)
+                    if filename in extracted_name:
+                        extracted_path = path
+                        break
+            
+            if not extracted_path:
+                # If no match found, skip this file
+                print(f"Warning: No matching compressed file found for {filename}")
+                continue
+            
+            # Get file sizes
+            original_size = os.path.getsize(original_path)
+            compressed_size = os.path.getsize(extracted_path)
+            size_diff = original_size - compressed_size
+            size_reduction_pct = round(size_diff / original_size * 100)
+            
+            # Decide whether to keep the compressed file
+            if size_reduction_pct < min_size_reduction:
+                action = f"Discarded (only {size_reduction_pct}% smaller)"
+                if verbose:
+                    print(f"{i+1} '{filename}': {original_size/1024:.1f}KB -> "
+                          f"{compressed_size/1024:.1f}KB which is "
+                          f"{size_diff/1024:.1f}KB = {size_reduction_pct}% smaller. "
+                          f"Compressed file discarded (< {min_size_reduction}% reduction).")
+            else:
+                # Determine the destination path
+                if inplace:
+                    dest_path = original_path
+                    # Move the original file to trash/delete it
+                    try:
+                        # Try to use send2trash if available
+                        from send2trash import send2trash
+                        send2trash(original_path)
+                        if verbose:
+                            print(f"Old file moved to trash.")
+                    except ImportError:
+                        # If send2trash isn't available, just use os.remove
+                        os.remove(original_path)
+                        if verbose:
+                            print(f"Old file deleted.")
+                    action = "Replaced original"
+                else:
+                    # Add suffix to the filename
+                    stem = original_file.stem
+                    dest_path = os.path.join(out_dir_path, f"{stem}{suffix}{original_file.suffix}")
+                    action = f"Saved with suffix '{suffix}'"
+                
+                # Copy the compressed file to the destination
+                shutil.copy2(extracted_path, dest_path)
+                
+                if verbose:
+                    print(f"{i+1} '{filename}': {original_size/1024:.1f}KB -> "
+                          f"{compressed_size/1024:.1f}KB which is "
+                          f"{size_diff/1024:.1f}KB = {size_reduction_pct}% smaller.")
+            
+            # Save stats
+            stats[filename] = {
+                "original size (B)": original_size,
+                "compressed size (B)": compressed_size,
+                "size reduction (B)": size_diff,
+                "size reduction (%)": size_reduction_pct,
+                "action": action,
+            }
+    
+    return stats
 
 
 if __name__ == "__main__":
